@@ -1,0 +1,11 @@
+# Ignora pastas de ambiente virtual Python
+venv/
+agro/
+env/
+
+# Ignora arquivos de sistema e cache
+__pycache__/
+*.pyc
+
+# Ignora senhas (se você usar arquivo .env)
+.env
