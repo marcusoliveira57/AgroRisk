@@ -1,0 +1,45 @@
+services:
+
+  # -------------------------------------------------------
+  # Banco de dados PostgreSQL
+  # Os scripts SQL em ./sql/ são executados automaticamente
+  # na primeira vez que o container é criado.
+  # -------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: agrorisk_db
+    environment:
+      POSTGRES_DB: agrorisk
+      POSTGRES_USER: agrorisk
+      POSTGRES_PASSWORD: agrorisk
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d   # roda os .sql na ordem alfabética
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agrorisk -d agrorisk"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------
+  # Aplicação Python
+  # Sobe o banco antes de rodar qualquer script.
+  # Use `docker compose run app python <script>.py` para
+  # executar os módulos individualmente (ver README).
+  # -------------------------------------------------------
+  app:
+    build: .
+    container_name: agrorisk_app
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    stdin_open: true   # mantém o stdin aberto para o simulador interativo
+    tty: true
+    volumes:
+      - ./dados:/app/dados   # monta os dados para o ETL enxergar
+
+volumes:
+  postgres_data:

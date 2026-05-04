@@ -3,7 +3,8 @@ CREATE TABLE cultura (
     nome VARCHAR(50) NOT NULL,
     praca_referencia VARCHAR(100),
     unidade_conab VARCHAR(20),
-    unidade_cepea VARCHAR(20)
+    unidade_cepea VARCHAR(20),
+    tempo_safra_meses INTEGER DEFAULT 6
 );
 
 CREATE TABLE custo_producao (
