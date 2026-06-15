@@ -99,12 +99,15 @@ docker compose run --rm app python simulador.py
 python simulador.py
 ```
 
-O sistema exibe as culturas disponíveis, solicita a seleção de duas para comparação, busca a Selic atual via **API do Banco Central** (ou aceita um valor manual) e gera uma **matriz de decisão** com:
+O sistema exibe as culturas disponíveis, solicita a seleção de duas para comparação, busca a Selic atual via **API do Banco Central** (ou aceita um valor manual), coleta a **estrutura de capital** (percentual financiado e taxa de juros) e gera um **relatório executivo** com:
 
 - Retorno esperado projetado (Ensemble ARIMA + Holt-Winters)
 - Nível de risco (Baixo / Moderado / Alto) + **VaR 95%**
-- **Índice de Sharpe Agrícola** (retorno ajustado pelo risco e pela Selic)
-- Lucro projetado sobre o investimento simulado
+- **Índice de Sharpe Agrícola** (retorno ajustado pelo risco e custo de oportunidade)
+- Lucro projetado sobre o investimento simulado vs. Rendimento na **Selic**
+- **Custo Médio Ponderado de Capital (WACC)** (custo real do dinheiro na operação)
+- Simulação de **Portfólio Diversificado** (mitigação de risco em alocação 50/50)
+- **Estratégia de Hedge na B3** (recomendação de limite de proteção via Opções de Venda/Puts)
 
 ### 🔬 Backtesting do modelo
 
@@ -178,6 +181,9 @@ cultura          (id, nome, praca_referencia, unidade_conab, unidade_cepea)
 3. **Retorno projetado** = média das previsões do **Ensemble (Auto-ARIMA + Holt-Winters/ETS)**
 4. **Sharpe Agrícola** = `(retorno - selic_período) / volatilidade` — compara culturas de ciclos diferentes
 5. **Benchmark** = rendimento equivalente da **Selic** no mesmo período de capital travado
+6. **Custo Médio Ponderado de Capital (WACC)** = (peso_próprio * selic) + (peso_banco * juros_financiamento) — define a taxa mínima de atratividade da operação frente ao endividamento
+7. **Piso de Proteção (Hedge)** = `preço_projetado - (Z-Score_95% * volatilidade_financeira)` — define o limite de queda para o cálculo de *Strike* na compra de Opções de Venda (Puts) na B3
+8. **Portfólio Diversificado** = média ponderada de risco e retorno da alocação — simula a mitigação da volatilidade agregada da fazenda
 
 ## 📄 Licença
 

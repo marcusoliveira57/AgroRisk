@@ -3,6 +3,7 @@ import pandas as pd
 import warnings
 import requests
 import pmdarima as pm
+import scipy.stats as st
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.stattools import adfuller
 from conexao import obter_conexao
@@ -136,7 +137,6 @@ def calcular_metricas(id_cultura, engine):
     nome_cultura = df['nome'].iloc[0]
     meses_safra = int(df['tempo_safra_meses'].iloc[0])
 
-    # 1. Preenchimento de lacunas com interpolação linear (neutro, sem autocorrelação artificial)
     df['data'] = pd.to_datetime(df['data'], utc=True).dt.tz_localize(None)
     df.set_index('data', inplace=True)
     df = df[['margem']].resample('MS').interpolate(method='linear')
@@ -145,51 +145,72 @@ def calcular_metricas(id_cultura, engine):
     total_meses = len(df)
     serie = df['margem'].values
 
-    # 2. Fallback para séries muito curtas
     if total_meses < 6:
         retorno = float(np.mean(serie)) * 100
         vol = float(np.std(serie, ddof=1)) * 100 if total_meses > 1 else 0.0
         var95 = float(np.percentile(serie, 5)) * 100
         return nome_cultura, meses_safra, retorno, vol, var95
 
-    # 3. Sazonalidade requer pelo menos 2 ciclos anuais completos
     usar_sazonalidade = total_meses >= 24
-
-    # 4. Teste de estacionariedade ADF (informativo — d=None no ARIMA já cuida disso)
     _serie_estacionaria(serie)
 
     # 5. Ensemble: combina ARIMA e ETS
     previsoes = []
     prev_arima = _prever_arima(serie, meses_safra, usar_sazonalidade)
     if prev_arima is not None:
-        previsoes.append(prev_arima)
+        # Garante que remove NaNs se o ARIMA cuspir algum por falta de convergência
+        prev_arima = prev_arima[~np.isnan(prev_arima)]
+        if len(prev_arima) > 0:
+            previsoes.append(prev_arima)
 
     prev_ets = _prever_ets(serie, meses_safra, usar_sazonalidade)
     if prev_ets is not None:
-        previsoes.append(prev_ets)
+        prev_ets = prev_ets[~np.isnan(prev_ets)]
+        if len(prev_ets) > 0:
+            previsoes.append(prev_ets)
 
+    # CORREÇÃO DA CONTAMINAÇÃO: Usamos np.nanmean para ignorar qualquer NaN residual
     if previsoes:
-        retorno = float(np.mean(previsoes, axis=0).mean()) * 100
+        # Achamos a média das projeções futuras
+        bloco_previsoes = np.concatenate(previsoes)
+        retorno = float(np.nanmean(bloco_previsoes)) * 100
     else:
-        retorno = float(np.mean(serie)) * 100
+        retorno = float(np.nanmean(serie)) * 100
 
-    # 6. Métricas de risco
-    vol = float(np.std(serie, ddof=1)) * 100       # Volatilidade (desvio padrão amostral)
-    var95 = float(np.percentile(serie, 5)) * 100   # VaR 95% (pior 5% dos meses históricos)
+    # 6. Métricas de risco usando funções seguras contra NaN (nanmean, nanstd)
+    vol = float(np.nanstd(serie, ddof=1)) * 100  # Ignora NaNs no cálculo da volatilidade
+    
+    # Se a série estiver limpa, calcula o percentil, senão usa um fallback seguro
+    serie_limpa = serie[~np.isnan(serie)]
+    if len(serie_limpa) > 0:
+        var95 = float(np.percentile(serie_limpa, 5)) * 100
+    else:
+        var95 = 0.0
 
     return nome_cultura, meses_safra, retorno, vol, var95
 
 
-def calcular_sharpe(retorno_pct, selic_aa, meses_safra, volatilidade):
-    """
-    Índice de Sharpe Agrícola: retorno excedente sobre a Selic (proporcional ao
-    período de capital travado) dividido pela volatilidade.
-    Permite comparar culturas de ciclos diferentes de forma justa.
-    """
-    if volatilidade == 0 or meses_safra == 0:
+# --- NOVAS FUNÇÕES ADICIONADAS ---
+
+def calcular_wacc(selic_aa, perc_financiado, juros_banco_aa):
+    """Estrutura de Capital: Calcula o Custo Médio Ponderado de Capital (WACC)."""
+    peso_banco = perc_financiado / 100.0
+    peso_proprio = 1.0 - peso_banco
+    wacc = (peso_proprio * selic_aa) + (peso_banco * juros_banco_aa)
+    return wacc
+
+
+def calcular_hedge_protecao(volatilidade_pct, confianca=0.95):
+    """Operações Financeiras: Calcula a amplitude ideal para proteção via Hedge."""
+    if volatilidade_pct == 0:
         return 0.0
-    selic_periodo = selic_aa * (meses_safra / 12)
-    return (retorno_pct - selic_periodo) / volatilidade
+    z_score = st.norm.ppf(confianca)  # Busca o multiplicador da curva normal (ex: 95% = 1.645)
+    amplitude = z_score * volatilidade_pct
+
+    if amplitude > 100.0:
+        return 99.9 # Trava no limite teórico
+    
+    return amplitude
 
 
 def classificar_risco(volatilidade):
@@ -198,69 +219,75 @@ def classificar_risco(volatilidade):
     else:                   return "Alto"
 
 
-def gerar_matriz_decisao(id_a, id_b, selic_aa, investimento):
+def gerar_matriz_decisao(id_a, id_b, selic_aa, investimento, perc_financiado, juros_banco):
     engine = obter_conexao()
+
+    # 1. Estrutura de Capital (WACC)
+    wacc_aa = calcular_wacc(selic_aa, perc_financiado, juros_banco)
+    
+    print("\n==================================================")
+    print("🏢 ESTRUTURA DE CAPITAL (WACC)")
+    print("==================================================")
+    print(f"Capital Próprio : {100 - perc_financiado:.1f}% (Custo: Selic {selic_aa}% a.a.)")
+    print(f"Capital Banco   : {perc_financiado:.1f}% (Custo: Financiamento {juros_banco}% a.a.)")
+    print(f"Custo Médio Ponderado de Capital (WACC): {wacc_aa:.2f}% a.a.")
+    print("-> Esta taxa define o retorno mínimo aceitável para mitigar custos de capital.\n")
 
     nome_a, meses_a, ret_a, risco_a, var_a = calcular_metricas(id_a, engine)
     nome_b, meses_b, ret_b, risco_b, var_b = calcular_metricas(id_b, engine)
 
+   # 2. Gestão de Investimentos (Cálculo do Portfólio 50/50)
+    ret_portfolio = (ret_a * 0.5) + (ret_b * 0.5)
+    risco_portfolio = ((risco_a**2 * 0.25) + (risco_b**2 * 0.25)) ** 0.5
+    meses_portfolio = (meses_a + meses_b) / 2
+
     lucro_a = investimento * (ret_a / 100)
     lucro_b = investimento * (ret_b / 100)
+    lucro_port = investimento * (ret_portfolio / 100)
 
-    selic_periodo_a = selic_aa * (meses_a / 12) if meses_a else 0
-    selic_periodo_b = selic_aa * (meses_b / 12) if meses_b else 0
-    lucro_rf_a = investimento * (selic_periodo_a / 100)
-    lucro_rf_b = investimento * (selic_periodo_b / 100)
+    # Custos de oportunidade ajustados ao tempo de capital travado pelo WACC
+    custo_wacc_a = investimento * ((wacc_aa * (meses_a / 12)) / 100) if meses_a else 0
+    custo_wacc_b = investimento * ((wacc_aa * (meses_b / 12)) / 100) if meses_b else 0
+    custo_wacc_port = investimento * ((wacc_aa * (meses_portfolio / 12)) / 100) if meses_portfolio else 0
 
-    sharpe_a = calcular_sharpe(ret_a, selic_aa, meses_a, risco_a)
-    sharpe_b = calcular_sharpe(ret_b, selic_aa, meses_b, risco_b)
+    # --- NOVO: Retorno se investido 100% na Selic (Renda Fixa) ---
+    lucro_selic_a = investimento * ((selic_aa * (meses_a / 12)) / 100) if meses_a else 0
+    lucro_selic_b = investimento * ((selic_aa * (meses_b / 12)) / 100) if meses_b else 0
+    lucro_selic_port = investimento * ((selic_aa * (meses_portfolio / 12)) / 100) if meses_portfolio else 0
 
-    print("\n=========================================")
-    print("🌱 AGRO-RISK TRACKER - PARECER FINAL")
-    print("=========================================")
-    print(f"Cenário: [1] {nome_a} vs [2] {nome_b}")
-    print(f"Custo de Oportunidade (Selic): {selic_aa}% a.a.\n")
+    print("==================================================")
+    print("🌱 GESTÃO DE INVESTIMENTOS (OPÇÕES DE ALOCAÇÃO)")
+    print("==================================================")
+    print(f">> ALOCAÇÃO 1: 100% {nome_a}")
+    print(f"   Tempo de Capital Travado: {meses_a} meses | Retorno Projetado: {ret_a:.1f}%")
+    print(f"   Risco (Volatilidade): {classificar_risco(risco_a)} ({risco_a:.1f}%) | VaR 95%: {var_a:.1f}%")
+    print(f"   Lucro da Safra: R$ {lucro_a:,.2f} | Custo do Dinheiro (WACC): R$ {custo_wacc_a:,.2f}")
+    print(f"   Comparativo -> Renda Fixa (Selic): R$ {lucro_selic_a:,.2f}\n")
 
-    print(f">> PROJEÇÃO CULTURA A ({nome_a}):")
-    print(f"   Tempo de Capital Travado    : {meses_a} meses")
-    print(f"   Retorno Esperado (Ensemble) : {ret_a:.1f}%")
-    print(f"   Risco (Volatilidade)        : {classificar_risco(risco_a)} ({risco_a:.1f}%)")
-    print(f"   VaR 95% (pior mês histórico): {var_a:.1f}%")
-    print(f"   Índice de Sharpe Agrícola   : {sharpe_a:.2f}")
-    print(f"   Lucro projetado             : R$ {lucro_a:.2f}")
-    print(f"   Selic equivalente (período) : R$ {lucro_rf_a:.2f}\n")
+    print(f">> ALOCAÇÃO 2: 100% {nome_b}")
+    print(f"   Tempo de Capital Travado: {meses_b} meses | Retorno Projetado: {ret_b:.1f}%")
+    print(f"   Risco (Volatilidade): {classificar_risco(risco_b)} ({risco_b:.1f}%) | VaR 95%: {var_b:.1f}%")
+    print(f"   Lucro da Safra: R$ {lucro_b:,.2f} | Custo do Dinheiro (WACC): R$ {custo_wacc_b:,.2f}")
+    print(f"   Comparativo -> Renda Fixa (Selic): R$ {lucro_selic_b:,.2f}\n")
 
-    print(f">> PROJEÇÃO CULTURA B ({nome_b}):")
-    print(f"   Tempo de Capital Travado    : {meses_b} meses")
-    print(f"   Retorno Esperado (Ensemble) : {ret_b:.1f}%")
-    print(f"   Risco (Volatilidade)        : {classificar_risco(risco_b)} ({risco_b:.1f}%)")
-    print(f"   VaR 95% (pior mês histórico): {var_b:.1f}%")
-    print(f"   Índice de Sharpe Agrícola   : {sharpe_b:.2f}")
-    print(f"   Lucro projetado             : R$ {lucro_b:.2f}")
-    print(f"   Selic equivalente (período) : R$ {lucro_rf_b:.2f}\n")
+    print(f">> ALOCAÇÃO 3: FAZENDA DIVERSIFICADA (50% {nome_a} / 50% {nome_b})")
+    print(f"   Tempo de Capital Travado: {meses_portfolio:.1f} meses | Retorno Projetado: {ret_portfolio:.1f}%")
+    print(f"   Risco Combinado: {classificar_risco(risco_portfolio)} ({risco_portfolio:.1f}%)")
+    print(f"   Lucro da Safra: R$ {lucro_port:,.2f} | Custo do Dinheiro (WACC): R$ {custo_wacc_port:,.2f}")
+    print(f"   Comparativo -> Renda Fixa (Selic): R$ {lucro_selic_port:,.2f}\n")
 
-    print(">> CONCLUSÃO:")
+    # 3. Operações Financeiras (Hedge)
+    print("==================================================")
+    print("🛡️ OPERAÇÕES FINANCEIRAS (ESTRATÉGIA DE HEDGE)")
+    print("==================================================")
+    amp_a = calcular_hedge_protecao(risco_a)
+    amp_b = calcular_hedge_protecao(risco_b)
 
-    supera_rf_a = lucro_a > lucro_rf_a
-    supera_rf_b = lucro_b > lucro_rf_b
-
-    if supera_rf_a and supera_rf_b:
-        print("   Filtro Renda Fixa: Ambas superam a Selic em seus períodos.")
-    elif supera_rf_a:
-        print(f"   Filtro Renda Fixa: Apenas {nome_a} supera a Selic de seu período.")
-    elif supera_rf_b:
-        print(f"   Filtro Renda Fixa: Apenas {nome_b} supera a Selic de seu período.")
-    else:
-        print("   Filtro Renda Fixa: NENHUMA supera a Selic. Operação agrícola não recomendada.")
-
-    vencedora_lucro  = nome_a if lucro_a  > lucro_b  else nome_b
-    vencedora_sharpe = nome_a if sharpe_a > sharpe_b else nome_b
-    risco_sharpe     = risco_a if sharpe_a > sharpe_b else risco_b
-
-    print(f"\n   Maior Lucro Absoluto        : {vencedora_lucro} (R$ {max(lucro_a, lucro_b):.2f})")
-    print(f"   Melhor Risco-Retorno (Sharpe): {vencedora_sharpe} (índice: {max(sharpe_a, sharpe_b):.2f})")
-    print(f"\n   Recomendação: Alocar em {vencedora_sharpe} — melhor retorno ajustado pelo risco")
-    print(f"   e pelo custo de oportunidade da Selic. (Perfil: {classificar_risco(risco_sharpe).upper()})")
+    print("Recomendação para travar o preço mínimo de venda na Bolsa (B3):")
+    print(f"- Para {nome_a}: Adquirir Puts (Opções de Venda) com proteção máxima contra quedas além de {amp_a:.1f}%.")
+    print(f"- Para {nome_b}: Adquirir Puts (Opções de Venda) com proteção máxima contra quedas além de {amp_b:.1f}%.")
+    print("Objetivo: Blindar o caixa do produtor contra oscilações que firam o custo operacional.")
+    print("==================================================\n")
 
 
 def iniciar_sistema():
@@ -272,7 +299,7 @@ def iniciar_sistema():
         return
 
     print("=========================================")
-    print("   BEM-VINDO AO AGRO-RISK TRACKER 1.0    ")
+    print("   BEM-VINDO AO AGRO-RISK TRACKER  ")
     print("=========================================")
     print("Culturas cadastradas no banco de dados:")
 
@@ -317,8 +344,26 @@ def iniciar_sistema():
     except ValueError:
         investimento = 1000.0
 
-    print("\n⏳ Treinando modelos preditivos (Ensemble ARIMA + Holt-Winters)...")
-    gerar_matriz_decisao(id_a, id_b, selic_aa, investimento)
+    # Coletores para Estrutura de Capital
+    print("\n-----------------------------------------")
+    print("🏦 PARAMETRIZAÇÃO DE CRÉDITO")
+    print("-----------------------------------------")
+    financiamento_input = input("Quantos % desse investimento será financiado pelo Banco? (Ex: 70): ")
+    try:
+        perc_financiado = float(financiamento_input.replace(',', '.')) if financiamento_input.strip() else 0.0
+    except ValueError:
+        perc_financiado = 0.0
+
+    juros_banco = 0.0
+    if perc_financiado > 0:
+        juros_input = input("Qual a taxa de juros anual desse financiamento? [% a.a.] (Ex: 8.5): ")
+        try:
+            juros_banco = float(juros_input.replace(',', '.')) if juros_input.strip() else 8.5
+        except ValueError:
+            juros_banco = 8.5
+
+    print("\n⏳ Computando dados institucionais e estruturando estratégias...")
+    gerar_matriz_decisao(id_a, id_b, selic_aa, investimento, perc_financiado, juros_banco)
 
 
 if __name__ == "__main__":
